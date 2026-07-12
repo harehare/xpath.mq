@@ -1,0 +1,261 @@
+include "test"
+| import "xml"
+| import "xpath"
+|
+
+# -- Fixture --
+
+let users_xml = "<users><user id=\"1\" active=\"true\"><name>Alice</name><email>alice@example.com</email><roles><role>admin</role><role>user</role></roles></user><user id=\"2\"><name>Bob</name><email>bob@example.com</email><roles><role>user</role></roles></user><user id=\"3\" active=\"true\"><name>Charlie</name><email>charlie@example.com</email><roles><role>editor</role><role>user</role></roles></user></users>" |
+let users = xml::xml_parse(users_xml) |
+let nested_xml = "<root><item id=\"outer\"><item id=\"inner\">leaf</item></item></root>" |
+let nested = xml::xml_parse(nested_xml) |
+
+# -- Basic child / absolute / self / wildcard --
+
+def test_relative_child_step():
+  let result = xpath::xpath_query(users, "user")
+  | assert_eq(len(result), 3)
+  | assert_eq(result[0]["tag"], "user")
+end
+
+def test_absolute_root_step():
+  let result = xpath::xpath_query(users, "/users")
+  | assert_eq(len(result), 1)
+  | assert_eq(result[0]["tag"], "users")
+end
+
+def test_absolute_root_wrong_name_matches_nothing():
+  let result = xpath::xpath_query(users, "/wrong")
+  | assert_eq(result, [])
+end
+
+def test_absolute_path():
+  let result = xpath::xpath_query(users, "/users/user")
+  | assert_eq(len(result), 3)
+end
+
+def test_self_dot():
+  let result = xpath::xpath_query(users, ".")
+  | assert_eq(len(result), 1)
+  | assert_eq(result[0]["tag"], "users")
+end
+
+def test_slash_alone_returns_context():
+  let result = xpath::xpath_query(users, "/")
+  | assert_eq(len(result), 1)
+  | assert_eq(result[0]["tag"], "users")
+end
+
+def test_wildcard_child():
+  let result = xpath::xpath_query(users, "*")
+  | assert_eq(len(result), 3)
+end
+
+def test_nested_child_path():
+  let result = xpath::xpath_query(users, "user/name")
+  | assert_eq(len(result), 3)
+  | assert_eq(result[0]["text"], "Alice")
+  | assert_eq(result[1]["text"], "Bob")
+  | assert_eq(result[2]["text"], "Charlie")
+end
+
+def test_no_match_returns_empty_array():
+  let result = xpath::xpath_query(users, "nope")
+  | assert_eq(result, [])
+end
+
+# -- Attributes --
+
+def test_attribute_value():
+  let result = xpath::xpath_query(users, "user/@id")
+  | assert_eq(result, ["1", "2", "3"])
+end
+
+def test_attribute_wildcard():
+  let first_user = first(xpath::xpath_query(users, "user"))
+  | let result = xpath::xpath_query(first_user, "@*")
+  | assert_eq(len(result), 2)
+end
+
+def test_missing_attribute_returns_empty():
+  let first_user = first(xpath::xpath_query(users, "user"))
+  | let result = xpath::xpath_query(first_user, "@missing")
+  | assert_eq(result, [])
+end
+
+# -- text() / name() --
+
+def test_text_function():
+  let result = xpath::xpath_query(users, "user/name/text()")
+  | assert_eq(result, ["Alice", "Bob", "Charlie"])
+end
+
+def test_text_function_on_element_without_text():
+  let result = xpath::xpath_query(users, "user/roles/text()")
+  | assert_eq(result, ["", "", ""])
+end
+
+# -- Parent axis --
+
+def test_parent_axis():
+  let result = xpath::xpath_query(users, "user/name/..")
+  | assert_eq(len(result), 3)
+  | assert_eq(result[0]["tag"], "user")
+end
+
+def test_parent_of_root_is_empty():
+  let result = xpath::xpath_query(users, "..")
+  | assert_eq(result, [])
+end
+
+# -- Descendant axis --
+
+def test_descendant_matches_deeply_nested():
+  let result = xpath::xpath_query(users, "//role")
+  | assert_eq(len(result), 5)
+end
+
+def test_descendant_includes_root_when_leading():
+  let result = xpath::xpath_query(users, "//users")
+  | assert_eq(len(result), 1)
+  | assert_eq(result[0]["tag"], "users")
+end
+
+def test_descendant_excludes_self_when_not_leading():
+  let result = xpath::xpath_query(nested, "item//item")
+  | assert_eq(len(result), 1)
+  | assert_eq(result[0]["attributes"]["id"], "inner")
+end
+
+def test_descendant_includes_self_only_when_leading():
+  let result = xpath::xpath_query(nested, "//item")
+  | assert_eq(len(result), 2)
+end
+
+def test_descendant_from_context_finds_nested():
+  let result = xpath::xpath_query(users, "user//role")
+  | assert_eq(len(result), 5)
+end
+
+# -- Positional predicates --
+
+def test_positional_predicate_first():
+  let result = xpath::xpath_query(users, "user[1]")
+  | assert_eq(len(result), 1)
+  | assert_eq(result[0]["attributes"]["id"], "1")
+end
+
+def test_positional_predicate_last_index():
+  let result = xpath::xpath_query(users, "user[3]")
+  | assert_eq(len(result), 1)
+  | assert_eq(result[0]["attributes"]["id"], "3")
+end
+
+def test_positional_predicate_out_of_range():
+  let result = xpath::xpath_query(users, "user[99]")
+  | assert_eq(result, [])
+end
+
+def test_last_function():
+  let result = xpath::xpath_query(users, "user[last()]")
+  | assert_eq(len(result), 1)
+  | assert_eq(result[0]["attributes"]["id"], "3")
+end
+
+def test_position_function():
+  let result = xpath::xpath_query(users, "user[position() = 2]")
+  | assert_eq(len(result), 1)
+  | assert_eq(result[0]["attributes"]["id"], "2")
+end
+
+# -- Attribute / child value predicates --
+
+def test_attribute_equality_predicate():
+  let result = xpath::xpath_query(users, "user[@id='2']")
+  | assert_eq(len(result), 1)
+  | assert_eq(result[0]["attributes"]["id"], "2")
+end
+
+def test_attribute_existence_predicate():
+  let result = xpath::xpath_query(users, "user[@active]")
+  | assert_eq(len(result), 2)
+end
+
+def test_child_text_equality_predicate():
+  let result = xpath::xpath_query(users, "user[name='Bob']")
+  | assert_eq(len(result), 1)
+  | assert_eq(result[0]["attributes"]["id"], "2")
+end
+
+def test_child_existence_predicate():
+  let result = xpath::xpath_query(users, "user[email]")
+  | assert_eq(len(result), 3)
+end
+
+def test_numeric_attribute_comparison():
+  let result = xpath::xpath_query(users, "user[@id > 1]")
+  | assert_eq(len(result), 2)
+end
+
+# -- Logical operators in predicates --
+
+def test_and_predicate():
+  let result = xpath::xpath_query(users, "user[@active and @id='3']")
+  | assert_eq(len(result), 1)
+  | assert_eq(result[0]["attributes"]["id"], "3")
+end
+
+def test_or_predicate():
+  let result = xpath::xpath_query(users, "user[@id='1' or @id='3']")
+  | assert_eq(len(result), 2)
+end
+
+def test_not_predicate():
+  let result = xpath::xpath_query(users, "user[not(@active)]")
+  | assert_eq(len(result), 1)
+  | assert_eq(result[0]["attributes"]["id"], "2")
+end
+
+# -- Function predicates --
+
+def test_contains_function():
+  let result = xpath::xpath_query(users, "user[contains(@id, '2')]")
+  | assert_eq(len(result), 1)
+end
+
+def test_starts_with_function():
+  let result = xpath::xpath_query(users, "user/name[starts-with(text(), 'A')]")
+  | assert_eq(len(result), 1)
+  | assert_eq(result[0]["text"], "Alice")
+end
+
+# -- Chained predicates and nested paths with predicates --
+
+def test_chained_predicate_then_child():
+  let result = xpath::xpath_query(users, "user[@id='1']/roles/role")
+  | assert_eq(len(result), 2)
+end
+
+def test_predicate_on_descendant_step():
+  let result = xpath::xpath_query(users, "//role[text()='user']")
+  | assert_eq(len(result), 3)
+end
+
+# -- xpath_first --
+
+def test_xpath_first_returns_first_match():
+  let result = xpath::xpath_first(users, "user/name/text()")
+  | assert_eq(result, "Alice")
+end
+
+def test_xpath_first_returns_none_when_no_match():
+  let result = xpath::xpath_first(users, "nope")
+  | assert_none(result)
+end
+
+# -- name() function --
+
+def test_name_function_predicate():
+  let result = xpath::xpath_query(users, "*[name()='user']")
+  | assert_eq(len(result), 3)
+end

@@ -1,0 +1,558 @@
+# XPath Implementation in mq
+#
+# Provides an abbreviated-XPath 1.0 style query language over the value tree
+# produced by xml.mq's `xml_parse`, i.e. dicts shaped like:
+#   {"tag": <string>, "attributes": <dict of string->string>,
+#    "children": <array of element dicts>, "text": <string or None>}
+#
+# Supported syntax:
+#   /a/b            child steps, absolute (from the given root node)
+#   a/b             child steps, relative (from the given context node)
+#   //a             descendant (any depth), also matches the context node itself
+#                   when it is the very first step of the expression
+#   a//b            descendant of a's matches (any depth below them)
+#   *               wildcard element step
+#   .               self
+#   ..              parent
+#   @name           attribute value
+#   @*              all attribute values
+#   text()          text content of the context node
+#   name()          tag name of the context node
+#   [n]             positional predicate (1-based)
+#   [@a]            attribute exists
+#   [@a='v']        attribute equals value
+#   [child]         child element exists
+#   [child='v']     child's text equals value
+#   [expr and expr] / [expr or expr] / [not(expr)]
+#   [contains(@a,'v')] / [starts-with(@a,'v')]
+#   [last()] / [position()]
+#
+# Simplifications versus full XPath, driven by xml.mq's data model:
+#   - There is no separate document node; the value passed to `xpath_query`
+#     is treated as both the context node and (for a leading "/") the root.
+#   - "string-value" of an element is just its own `text` field (the text
+#     immediately inside it), not the concatenation of all descendant text.
+#   - Mixed content ordering (text interleaved with child elements) is lost
+#     by xml_parse itself, so it is not reconstructed here either.
+#   - position()/last() for a `//` step are computed over the flattened list
+#     of matches found under each context node, not grouped per ancestor.
+#   - No union operator (`|`), no unabbreviated axes (`child::`, `parent::`, ...).
+
+# -- Lexer --
+
+def _xp_lex(s):
+  var pos = 0
+  | var tokens = []
+  | let n = len(s)
+  | let _ = while (pos < n):
+      let c = s[pos]
+      | if (c == " " || c == "\t" || c == "\n" || c == "\r"):
+          do pos += 1 | tokens end
+        elif (c == "/" && pos + 1 < n && s[pos + 1] == "/"):
+          do tokens += [{"t": "dslash"}] | pos += 2 | tokens end
+        elif (c == "/"):
+          do tokens += [{"t": "slash"}] | pos += 1 | tokens end
+        elif (c == "." && pos + 1 < n && s[pos + 1] == "."):
+          do tokens += [{"t": "dotdot"}] | pos += 2 | tokens end
+        elif (c == "."):
+          do tokens += [{"t": "dot"}] | pos += 1 | tokens end
+        elif (c == "*"):
+          do tokens += [{"t": "star"}] | pos += 1 | tokens end
+        elif (c == "@"):
+          do tokens += [{"t": "at"}] | pos += 1 | tokens end
+        elif (c == "["):
+          do tokens += [{"t": "lbracket"}] | pos += 1 | tokens end
+        elif (c == "]"):
+          do tokens += [{"t": "rbracket"}] | pos += 1 | tokens end
+        elif (c == "("):
+          do tokens += [{"t": "lparen"}] | pos += 1 | tokens end
+        elif (c == ")"):
+          do tokens += [{"t": "rparen"}] | pos += 1 | tokens end
+        elif (c == ","):
+          do tokens += [{"t": "comma"}] | pos += 1 | tokens end
+        elif (c == "!" && pos + 1 < n && s[pos + 1] == "="):
+          do tokens += [{"t": "neq"}] | pos += 2 | tokens end
+        elif (c == "<" && pos + 1 < n && s[pos + 1] == "="):
+          do tokens += [{"t": "le"}] | pos += 2 | tokens end
+        elif (c == ">" && pos + 1 < n && s[pos + 1] == "="):
+          do tokens += [{"t": "ge"}] | pos += 2 | tokens end
+        elif (c == "<"):
+          do tokens += [{"t": "lt"}] | pos += 1 | tokens end
+        elif (c == ">"):
+          do tokens += [{"t": "gt"}] | pos += 1 | tokens end
+        elif (c == "="):
+          do tokens += [{"t": "eq"}] | pos += 1 | tokens end
+        elif (c == "\"" || c == "'"):
+          do
+            let q = c
+            | let rest = slice(s, pos + 1, n)
+            | let close_idx = index(rest, q)
+            | if (close_idx == -1):
+                error("xpath: unterminated string literal")
+              else:
+                do
+                  tokens += [{"t": "str", "v": slice(rest, 0, close_idx)}]
+                  | pos += close_idx + 2
+                  | tokens
+                end
+          end
+        elif (is_regex_match(slice(s, pos, n), "^[0-9]+(?:\\.[0-9]+)?")):
+          do
+            let m = first(regex_match(slice(s, pos, n), "^[0-9]+(?:\\.[0-9]+)?"))
+            | tokens += [{"t": "num", "v": m}]
+            | pos += len(m)
+            | tokens
+          end
+        elif (is_regex_match(slice(s, pos, n), "^[A-Za-z_][A-Za-z0-9_\\-:]*")):
+          do
+            let m = first(regex_match(slice(s, pos, n), "^[A-Za-z_][A-Za-z0-9_\\-:]*"))
+            | tokens += [{"t": "ident", "v": m}]
+            | pos += len(m)
+            | tokens
+          end
+        else:
+          error("xpath: unexpected character: " + c)
+    end
+  | tokens
+end
+
+def _xp_peek(tokens, pos):
+  if (pos >= len(tokens)): None
+  else: tokens[pos]
+end
+
+def _xp_tt(tokens, pos):
+  let tok = _xp_peek(tokens, pos)
+  | if (is_none(tok)): "eof"
+  else: tok["t"]
+end
+
+# -- Path parser --
+
+def _xp_leading(tokens):
+  if (_xp_tt(tokens, 0) == "dslash"):
+    {"pos": 1, "sep": "descendant"}
+  elif (_xp_tt(tokens, 0) == "slash"):
+    {"pos": 1, "sep": "root"}
+  else:
+    {"pos": 0, "sep": "child"}
+end
+
+def _xp_parse_attribute_step(tokens, pos):
+  let tt = _xp_tt(tokens, pos)
+  | if (tt == "star"):
+      _xp_parse_predicates(tokens, pos + 1, {"axis": "attribute", "test": {"kind": "wildcard"}, "predicates": []})
+    elif (tt == "ident"):
+      _xp_parse_predicates(tokens, pos + 1, {"axis": "attribute", "test": {"kind": "name", "name": tokens[pos]["v"]}, "predicates": []})
+    else:
+      error("xpath: expected attribute name after '@'")
+end
+
+def _xp_parse_step(tokens, pos, sep, is_leading):
+  let tt = _xp_tt(tokens, pos)
+  | if (tt == "dotdot"):
+      _xp_parse_predicates(tokens, pos + 1, {"axis": "parent", "test": None, "predicates": []})
+    elif (tt == "dot"):
+      _xp_parse_predicates(tokens, pos + 1, {"axis": "self", "test": None, "predicates": []})
+    elif (tt == "at"):
+      _xp_parse_attribute_step(tokens, pos + 1)
+    elif (tt == "star"):
+      _xp_parse_predicates(tokens, pos + 1, {"axis": sep, "test": {"kind": "wildcard"}, "predicates": [], "leading": is_leading})
+    elif (tt == "ident" && tokens[pos]["v"] == "text" && _xp_tt(tokens, pos + 1) == "lparen" && _xp_tt(tokens, pos + 2) == "rparen"):
+      _xp_parse_predicates(tokens, pos + 3, {"axis": "text", "test": None, "predicates": []})
+    elif (tt == "ident"):
+      _xp_parse_predicates(tokens, pos + 1, {"axis": sep, "test": {"kind": "name", "name": tokens[pos]["v"]}, "predicates": [], "leading": is_leading})
+    else:
+      error("xpath: unexpected token in path step: " + tt)
+end
+
+def _xp_parse_predicates(tokens, pos, step):
+  var cur = pos
+  | var preds = step["predicates"]
+  | var done = false
+  | let _ = while (!done):
+      if (_xp_tt(tokens, cur) == "lbracket"):
+        do
+          let r = _xp_parse_or(tokens, cur + 1)
+          | if (_xp_tt(tokens, r[0]) != "rbracket"):
+              error("xpath: expected ']'")
+          | preds += [r[1]]
+          | cur = r[0] + 1
+          | preds
+        end
+      else:
+        do done = true | preds end
+    end
+  | [cur, set(step, "predicates", preds)]
+end
+
+def _xp_parse(tokens):
+  let n = len(tokens)
+  | if (n == 0):
+      error("xpath: empty expression")
+    else:
+      do
+        let lead = _xp_leading(tokens)
+        | var pos = lead["pos"]
+        | var sep = lead["sep"]
+        | var steps = []
+        | var is_first = true
+        | var done = false
+        | let _ = while (!done):
+            if (pos >= n):
+              do done = true | steps end
+            else:
+              do
+                let leading_flag = is_first && sep == "descendant"
+                | let r = _xp_parse_step(tokens, pos, sep, leading_flag)
+                | steps += [r[1]]
+                | pos = r[0]
+                | is_first = false
+                | if (pos >= n):
+                    do done = true | steps end
+                  elif (_xp_tt(tokens, pos) == "dslash"):
+                    do sep = "descendant" | pos += 1 | steps end
+                  elif (_xp_tt(tokens, pos) == "slash"):
+                    do sep = "child" | pos += 1 | steps end
+                  else:
+                    error("xpath: unexpected token after step (expected '/' or '//')")
+              end
+          end
+        | steps
+      end
+end
+
+# -- Predicate expression parser (precedence: or > and > comparison > primary) --
+
+def _xp_is_nullary_fn(name):
+  name == "text" || name == "last" || name == "position" || name == "name"
+end
+
+def _xp_cmp_op(t):
+  t == "eq" || t == "neq" || t == "lt" || t == "le" || t == "gt" || t == "ge"
+end
+
+def _xp_parse_primary(tokens, pos):
+  let tt = _xp_tt(tokens, pos)
+  | if (tt == "num"):
+      [pos + 1, {"k": "num", "v": to_number(tokens[pos]["v"])}]
+    elif (tt == "str"):
+      [pos + 1, {"k": "str", "v": tokens[pos]["v"]}]
+    elif (tt == "at"):
+      if (_xp_tt(tokens, pos + 1) != "ident"):
+        error("xpath: expected attribute name after '@'")
+      else:
+        [pos + 2, {"k": "attr", "name": tokens[pos + 1]["v"]}]
+    elif (tt == "lparen"):
+      do
+        let r = _xp_parse_or(tokens, pos + 1)
+        | if (_xp_tt(tokens, r[0]) != "rparen"):
+            error("xpath: expected ')'")
+          else:
+            [r[0] + 1, r[1]]
+      end
+    elif (tt == "ident" && tokens[pos]["v"] == "not" && _xp_tt(tokens, pos + 1) == "lparen"):
+      do
+        let r = _xp_parse_or(tokens, pos + 2)
+        | if (_xp_tt(tokens, r[0]) != "rparen"):
+            error("xpath: expected ')'")
+          else:
+            [r[0] + 1, {"k": "call", "name": "not", "args": [r[1]]}]
+      end
+    elif (tt == "ident" && (tokens[pos]["v"] == "contains" || tokens[pos]["v"] == "starts-with") && _xp_tt(tokens, pos + 1) == "lparen"):
+      do
+        let fname = tokens[pos]["v"]
+        | let r1 = _xp_parse_or(tokens, pos + 2)
+        | if (_xp_tt(tokens, r1[0]) != "comma"):
+            error("xpath: expected ',' in " + fname + "()")
+          else:
+            do
+              let r2 = _xp_parse_or(tokens, r1[0] + 1)
+              | if (_xp_tt(tokens, r2[0]) != "rparen"):
+                  error("xpath: expected ')'")
+                else:
+                  [r2[0] + 1, {"k": "call", "name": fname, "args": [r1[1], r2[1]]}]
+            end
+      end
+    elif (tt == "ident" && _xp_is_nullary_fn(tokens[pos]["v"]) && _xp_tt(tokens, pos + 1) == "lparen" && _xp_tt(tokens, pos + 2) == "rparen"):
+      [pos + 3, {"k": "call", "name": tokens[pos]["v"], "args": []}]
+    elif (tt == "ident"):
+      [pos + 1, {"k": "elem", "name": tokens[pos]["v"]}]
+    else:
+      error("xpath: unexpected token in predicate expression")
+end
+
+def _xp_parse_cmp(tokens, pos):
+  let r1 = _xp_parse_primary(tokens, pos)
+  | let opt = _xp_tt(tokens, r1[0])
+  | if (_xp_cmp_op(opt)):
+      do
+        let r2 = _xp_parse_primary(tokens, r1[0] + 1)
+        | [r2[0], {"k": "cmp", "op": opt, "l": r1[1], "r": r2[1]}]
+      end
+    else:
+      r1
+end
+
+def _xp_parse_and_rest(tokens, pos, left):
+  if (_xp_tt(tokens, pos) == "ident" && tokens[pos]["v"] == "and"):
+    do
+      let r = _xp_parse_cmp(tokens, pos + 1)
+      | _xp_parse_and_rest(tokens, r[0], {"k": "and", "l": left, "r": r[1]})
+    end
+  else:
+    [pos, left]
+end
+
+def _xp_parse_and(tokens, pos):
+  let r1 = _xp_parse_cmp(tokens, pos)
+  | _xp_parse_and_rest(tokens, r1[0], r1[1])
+end
+
+def _xp_parse_or_rest(tokens, pos, left):
+  if (_xp_tt(tokens, pos) == "ident" && tokens[pos]["v"] == "or"):
+    do
+      let r = _xp_parse_and(tokens, pos + 1)
+      | _xp_parse_or_rest(tokens, r[0], {"k": "or", "l": left, "r": r[1]})
+    end
+  else:
+    [pos, left]
+end
+
+def _xp_parse_or(tokens, pos):
+  let r1 = _xp_parse_and(tokens, pos)
+  | _xp_parse_or_rest(tokens, r1[0], r1[1])
+end
+
+# -- Evaluation helpers --
+
+def _xp_node_test_matches(node, test):
+  if (!is_dict(node)):
+    false
+  elif (test["kind"] == "wildcard"):
+    true
+  else:
+    node["tag"] == test["name"]
+end
+
+def _xp_string_value(node):
+  if (is_dict(node)):
+    do
+      let t = node["text"]
+      | if (is_none(t)): "" else: t
+    end
+  elif (is_string(node)):
+    node
+  else:
+    to_string(node)
+end
+
+def _xp_to_str(v):
+  if (is_none(v)): ""
+  elif (is_string(v)): v
+  else: to_string(v)
+end
+
+def _xp_as_number(v):
+  if (is_number(v)): v
+  elif (is_string(v) && is_regex_match(v, "^-?[0-9]+(?:\\.[0-9]+)?$")): to_number(v)
+  else: None
+end
+
+def _xp_boolean(v):
+  if (is_number(v)): v != 0
+  elif (is_bool(v)): v
+  elif (is_none(v)): false
+  elif (is_string(v)): v != ""
+  else: true
+end
+
+def _xp_pred_truthy(v, pos):
+  if (is_number(v)): v == pos
+  else: _xp_boolean(v)
+end
+
+def _xp_eval_cmp(expr, val, pos, last):
+  let lv = _xp_eval_expr(expr["l"], val, pos, last)
+  | let rv = _xp_eval_expr(expr["r"], val, pos, last)
+  | let op = expr["op"]
+  | if (op == "eq"):
+      _xp_to_str(lv) == _xp_to_str(rv)
+    elif (op == "neq"):
+      _xp_to_str(lv) != _xp_to_str(rv)
+    else:
+      do
+        let ln = _xp_as_number(lv)
+        | let rn = _xp_as_number(rv)
+        | if (is_none(ln) || is_none(rn)):
+            false
+          elif (op == "lt"):
+            ln < rn
+          elif (op == "le"):
+            ln <= rn
+          elif (op == "gt"):
+            ln > rn
+          else:
+            ln >= rn
+      end
+end
+
+def _xp_eval_call(expr, val, pos, last):
+  let name = expr["name"]
+  | let args = expr["args"]
+  | if (name == "text"):
+      _xp_string_value(val)
+    elif (name == "last"):
+      last
+    elif (name == "position"):
+      pos
+    elif (name == "name"):
+      if (is_dict(val)): val["tag"] else: ""
+    elif (name == "not"):
+      !_xp_boolean(_xp_eval_expr(args[0], val, pos, last))
+    elif (name == "contains"):
+      contains(_xp_to_str(_xp_eval_expr(args[0], val, pos, last)), _xp_to_str(_xp_eval_expr(args[1], val, pos, last)))
+    elif (name == "starts-with"):
+      starts_with(_xp_to_str(_xp_eval_expr(args[0], val, pos, last)), _xp_to_str(_xp_eval_expr(args[1], val, pos, last)))
+    else:
+      error("xpath: unknown function: " + name)
+end
+
+def _xp_eval_expr(expr, val, pos, last):
+  let k = expr["k"]
+  | if (k == "num"):
+      expr["v"]
+    elif (k == "str"):
+      expr["v"]
+    elif (k == "attr"):
+      if (is_dict(val)): val["attributes"][expr["name"]] else: None
+    elif (k == "elem"):
+      do
+        let matches = if (is_dict(val)):
+            filter(val["children"], fn(ch): is_dict(ch) && ch["tag"] == expr["name"];)
+          else:
+            []
+        | if (is_empty(matches)): None else: _xp_string_value(first(matches))
+      end
+    elif (k == "call"):
+      _xp_eval_call(expr, val, pos, last)
+    elif (k == "and"):
+      _xp_boolean(_xp_eval_expr(expr["l"], val, pos, last)) && _xp_boolean(_xp_eval_expr(expr["r"], val, pos, last))
+    elif (k == "or"):
+      _xp_boolean(_xp_eval_expr(expr["l"], val, pos, last)) || _xp_boolean(_xp_eval_expr(expr["r"], val, pos, last))
+    elif (k == "cmp"):
+      _xp_eval_cmp(expr, val, pos, last)
+    else:
+      error("xpath: unknown expression kind: " + k)
+end
+
+def _xp_filter_one_predicate(pred, candidates):
+  let n = len(candidates)
+  | if (n == 0):
+      []
+    else:
+      fold(range(0, n - 1), [], fn(acc, i):
+        let cand = candidates[i]
+        | let v = _xp_eval_expr(pred, cand["value"], i + 1, n)
+        | if (_xp_pred_truthy(v, i + 1)): acc + [cand] else: acc;
+      )
+end
+
+def _xp_filter_by_predicates(predicates, candidates):
+  fold(predicates, candidates, fn(cands, pred): _xp_filter_one_predicate(pred, cands);)
+end
+
+def _xp_collect_descendants(ctxitem, test, include_self):
+  let node = ctxitem["value"]
+  | if (!is_dict(node)):
+      []
+    else:
+      do
+        let self_match = if (include_self && _xp_node_test_matches(node, test)): [ctxitem] else: []
+        | let nested = fold(node["children"], [], fn(acc, child):
+            acc + _xp_collect_descendants({"value": child, "parent": ctxitem}, test, true);
+          )
+        | self_match + nested
+      end
+end
+
+def _xp_attr_candidates(test, ctxitem):
+  let node = ctxitem["value"]
+  | if (!is_dict(node)):
+      []
+    else:
+      do
+        let attrs = node["attributes"]
+        | if (test["kind"] == "wildcard"):
+            map(entries(attrs), fn(e): {"value": last(e), "parent": ctxitem};)
+          else:
+            do
+              let v = attrs[test["name"]]
+              | if (is_none(v)): [] else: [{"value": v, "parent": ctxitem}]
+            end
+      end
+end
+
+def _xp_text_candidates(ctxitem):
+  let node = ctxitem["value"]
+  | if (is_dict(node)):
+      [{"value": _xp_string_value(node), "parent": ctxitem}]
+    elif (is_string(node)):
+      [{"value": node, "parent": ctxitem["parent"]}]
+    else:
+      []
+end
+
+def _xp_step_candidates(step, ctxitem):
+  let axis = step["axis"]
+  | let node = ctxitem["value"]
+  | if (axis == "self"):
+      [ctxitem]
+    elif (axis == "parent"):
+      if (is_none(ctxitem["parent"])): [] else: [ctxitem["parent"]]
+    elif (axis == "attribute"):
+      _xp_attr_candidates(step["test"], ctxitem)
+    elif (axis == "text"):
+      _xp_text_candidates(ctxitem)
+    elif (axis == "child"):
+      if (!is_dict(node)):
+          []
+        else:
+          map(filter(node["children"], fn(ch): _xp_node_test_matches(ch, step["test"]);), fn(ch): {"value": ch, "parent": ctxitem};)
+    elif (axis == "root"):
+      if (_xp_node_test_matches(node, step["test"])): [ctxitem] else: []
+    elif (axis == "descendant"):
+      _xp_collect_descendants(ctxitem, step["test"], step["leading"])
+    else:
+      error("xpath: unknown axis: " + axis)
+end
+
+def _xp_eval_step(step, ctx):
+  fold(ctx, [], fn(acc, c):
+    let cands = _xp_step_candidates(step, c)
+    | acc + _xp_filter_by_predicates(step["predicates"], cands);
+  )
+end
+
+# -- Public API --
+
+# Runs an XPath-like query over an xml.mq value tree and returns an array of
+# matches (element dicts for element steps, strings for `@attr`/`text()`/`name()`).
+def xpath_query(node, path):
+  let p = to_string(path)
+  | if (p == "/" || p == "."):
+      [node]
+    else:
+      do
+        let steps = _xp_parse(_xp_lex(p))
+        | let ctx0 = [{"value": node, "parent": None}]
+        | let result_ctx = fold(steps, ctx0, fn(ctx, step): _xp_eval_step(step, ctx);)
+        | map(result_ctx, fn(c): c["value"];)
+      end
+end
+
+# Convenience wrapper: returns the first match of `xpath_query`, or None.
+def xpath_first(node, path):
+  let results = xpath_query(node, path)
+  | if (is_empty(results)): None else: first(results)
+end
