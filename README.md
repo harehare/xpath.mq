@@ -34,6 +34,20 @@ If you copied it to the mq built-in module directory:
 mq -I xml 'import "xpath" | xpath::xpath_query(., "//user/@id")' input.xml
 ```
 
+### HTTP Import (no local installation needed)
+
+If `mq` was built with the `http-import` feature, you can import directly from GitHub without any local setup. This requires the `--allow-http-import` flag, which is disabled by default:
+
+```sh
+mq --allow-http-import -I xml 'import "github.com/harehare/xpath.mq" | xpath::xpath_query(., "//user/@id")' input.xml
+```
+
+Pin to a specific release with `@vX.Y.Z`:
+
+```sh
+mq --allow-http-import -I xml 'import "github.com/harehare/xpath.mq@v1.0.0" | xpath::xpath_query(., "//user/@id")' input.xml
+```
+
 ## API
 
 ### `xpath_query(node, path)`
